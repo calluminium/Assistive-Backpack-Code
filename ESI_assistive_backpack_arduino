@@ -1,0 +1,1065 @@
+/*
+  ESI Assistive Backpack - item tracking sketch (RFID + DFPlayer + LCD + RGB)
+  This program helps users check that they have packed the correct items for a 
+  selected activity. Intended for dementia patients.
+
+  Written by Callum Storrar
+  Utilises library by Oliver Mckinlay
+  Created: 17/9/26
+  Last Edited: 18/10/26
+
+  The LCD circuit:
+ * LCD RS pin to digital pin 22
+ * LCD Enable pin to digital pin 23
+ * LCD D4 pin to digital pin 24
+ * LCD D5 pin to digital pin 25
+ * LCD D6 pin to digital pin 26
+ * LCD D7 pin to digital pin 27
+ * LCD R/W pin to ground
+ * wiper to LCD VO pin to resistance to ground
+
+  The RGB circuit:
+ * Red Pin (next to cathode) to 220ohm to digital pin 4
+ * Cathode Pin to ground
+ * Green Pin to 220ohm to digital pin 3
+ * Blue Pin to 220ohm to digital pin 2
+
+  The RFID circuit (4x MFRC522, Mega hardware SPI):
+ * Reader 1 SDA/SS to digital pin 37
+ * Reader 2 SDA/SS to digital pin 39
+ * Reader 3 SDA/SS to digital pin 41
+ * Reader 4 SDA/SS to digital pin 43
+ * Reader 1 RST to digital pin 36
+ * Reader 2 RST to digital pin 38
+ * Reader 3 RST to digital pin 40
+ * Reader 4 RST to digital pin 42
+ * All readers SCK to pin 52 (shared)
+ * All readers MOSI to pin 51 (shared)
+ * All readers MISO to pin 50 (shared)
+ * All readers 3.3V to 3.3V (NOT 5V) and GND to ground
+
+  DFPlayer Mini (SoftwareSerial):
+ * DFPlayer TX to digital pin 13
+ * DFPlayer RX to digital pin 12 through a 1k resistor
+ * VCC to 5V, GND to ground
+
+ created 17 Sept 2026
+ by Callum Storrar
+*/
+
+// Included libraries
+#include <Arduino.h>
+#include <SPI.h>
+#include <MFRC522.h>
+#include <LiquidCrystal.h>
+#include <SoftwareSerial.h>
+#include <DFRobotDFPlayerMini.h>
+#include <EEPROM.h>
+#include <string.h>
+
+#include <Backpack.h>
+#include <Inventory.h>
+#include <Task.h>
+#include <Events.h>
+
+// --- Pin configurations --- //
+const uint8_t BUTTON_1_PIN = 30;
+const uint8_t BUTTON_2_PIN = 31;
+const uint8_t BUTTON_3_PIN = 32;
+
+const uint8_t RFID_SS_PINS[4]  = {37, 39, 41, 43};
+const uint8_t RFID_RST_PINS[4] = {36, 38, 40, 42};
+
+const uint8_t RGB_RED_PIN   = 4;
+const uint8_t RGB_GREEN_PIN = 3;
+const uint8_t RGB_BLUE_PIN  = 2;
+
+const uint8_t DFPLAYER_RX_PIN = 13; // Arduino receives from DFPlayer TX
+const uint8_t DFPLAYER_TX_PIN = 12; // Arduino sends to DFPlayer RX via 1k resistor
+
+// --- Device setups --- //
+LiquidCrystal lcd(22, 23, 24, 25, 26, 27);
+
+SoftwareSerial dfSerial(DFPLAYER_RX_PIN, DFPLAYER_TX_PIN);
+DFRobotDFPlayerMini player;
+
+MFRC522 readers[4] = {
+    MFRC522(RFID_SS_PINS[0], RFID_RST_PINS[0]),
+    MFRC522(RFID_SS_PINS[1], RFID_RST_PINS[1]),
+    MFRC522(RFID_SS_PINS[2], RFID_RST_PINS[2]),
+    MFRC522(RFID_SS_PINS[3], RFID_RST_PINS[3])
+};
+
+// --- Library setup --- //
+Inventory inventory;
+Backpack backpack(inventory);
+
+// --- Button states --- //
+// Store the information needed to detect button presses reliably.
+struct ButtonState {
+  uint8_t pin;
+  bool stableState;
+  bool lastReading;
+  unsigned long lastChange;
+};
+
+
+ButtonState buttons[3] = {
+  {BUTTON_1_PIN, HIGH, HIGH, 0},
+  {BUTTON_2_PIN, HIGH, HIGH, 0},
+  {BUTTON_3_PIN, HIGH, HIGH, 0}
+};
+
+//How long the button needs to be pressed before being accepted
+const unsigned long DEBOUNCE_MS = 35;
+
+bool buttonPressed(uint8_t index) {
+  // Read the current button state and current time.
+  bool reading = digitalRead(buttons[index].pin);
+  unsigned long now = millis();
+
+  // If the electrical reading changes, restart the debounce timer.
+  if (reading != buttons[index].lastReading) {
+    buttons[index].lastChange = now;
+    buttons[index].lastReading = reading;
+  }
+
+  // Accept the change only after the reading has been stable
+  if ((now - buttons[index].lastChange) >= DEBOUNCE_MS &&
+      reading != buttons[index].stableState) {
+    buttons[index].stableState = reading;
+
+    if (buttons[index].stableState == LOW) {
+      return true; // press edge only
+    }
+  }
+  return false;
+}
+
+
+// --- Audio Queue --- //
+/*
+SD CARD AUDIO LAYOUT (FAT32, folders in root, played with playFolder)
+Folders are named 01..04, files are named 001.mp3, 002.mp3, ...
+
+FOLDER 01 - General cues
+  001.mp3  Starting task
+  002.mp3  Item added
+  003.mp3  That item isn't needed
+  004.mp3  Unknown tag
+  005.mp3  Item removed
+  006.mp3  Task stopped
+  007.mp3  You're ready to go
+  008.mp3  Please add these items to your backpack
+  009.mp3  Task Completed
+
+FOLDER 02 - "<item> needed" (file number = ItemType value)
+  001.mp3  Wallet needed
+  002.mp3  Laptop needed
+  003.mp3  Phone needed
+  004.mp3  Keys needed
+  005.mp3  Charger needed
+  006.mp3  Water bottle needed
+  007.mp3  Medication needed
+  008.mp3  Glasses needed
+  009.mp3  Umbrella needed
+  010.mp3  Book needed
+  011.mp3  Headphones needed
+  012.mp3  Diary needed
+
+FOLDER 03 - "<task> task selected" (file number = TaskType value)
+  001.mp3  University task selected
+  002.mp3  Gym task selected
+  003.mp3  Work task selected
+  004.mp3  Doctors task selected
+  005.mp3  Park task selected
+  006.mp3  Friend's house task selected
+  007.mp3  Shopping task selected
+
+FOLDER 04 - 5-minute reminder "You're doing the <task> task"
+  001.mp3  You're doing the University task
+  002.mp3  You're doing the Gym task
+  003.mp3  You're doing the Work task
+  004.mp3  You're doing the Doctors task
+  005.mp3  You're doing the Park task
+  006.mp3  You're doing the Friend's house task
+  007.mp3  You're doing your shopping task
+
+Item and task file numbers must match the enum order in Item.h and Task.h.
+If you reorder an enum, renumber the files to match.
+*/
+// Each queued audio message identifies a folder and file on the SD card.
+struct AudioCue {
+  uint8_t folder;
+  uint8_t file;
+};
+
+const uint8_t AUDIO_QUEUE_SIZE = 20;
+AudioCue audioQueue[AUDIO_QUEUE_SIZE];
+
+// head = next message to play
+// tail = next free position
+// count = number of messages waiting in the queue.
+uint8_t audioHead = 0, audioTail = 0, audioCount = 0;
+
+// Track playback status and timing for the audio service.
+bool audioPlaying = false;
+unsigned long audioStartedAt = 0;
+unsigned long lastTrackFinishedAt = 0;
+
+// Prevent a failed or unresponsive player from blocking the queue forever
+const unsigned long AUDIO_FAILSAFE_MS = 10000UL;
+
+// Wait briefly between tracks to separate spoken messages
+const unsigned long TRACK_GAP_MS = 300UL;
+
+// Record whether the DFPlayer initialised successfully
+bool dfPlayerReady = false;
+// Used to avoid repeating the first required-item announcement.
+bool suppressNextItemRequiredAudio = false;
+
+// Add an audio request to the queue if the player is ready,
+// the folder and file are valid, and there is space available.
+void queueAudio(uint8_t folder, uint8_t file) {
+  if (!dfPlayerReady || folder < 1 || folder > 4 || file == 0) {
+    return;
+  }
+
+  if (audioCount >= AUDIO_QUEUE_SIZE) {
+    return;
+  }
+
+  audioQueue[audioTail] = {folder, file};
+  audioTail = (audioTail + 1) % AUDIO_QUEUE_SIZE;
+  audioCount++;
+}
+
+// Check player feedback, handle playback timeouts,
+// and start the next queued message when playback is idle.
+void serviceAudio() {
+  if (!dfPlayerReady) {
+    return;
+  }
+
+  while (player.available()) {
+    uint8_t type = player.readType();
+    int value = player.read();
+    (void)value;
+
+    if (type == DFPlayerPlayFinished || type == DFPlayerError) {
+      audioPlaying = false;
+      lastTrackFinishedAt = millis();
+    }
+  }
+
+  if (audioPlaying &&
+      millis() - audioStartedAt >= AUDIO_FAILSAFE_MS) {
+    audioPlaying = false;
+    lastTrackFinishedAt = millis();
+  }
+
+  if (!audioPlaying &&
+      audioCount > 0 &&
+      millis() - lastTrackFinishedAt >= TRACK_GAP_MS) {
+
+    AudioCue cue = audioQueue[audioHead];
+
+    audioHead = (audioHead + 1) % AUDIO_QUEUE_SIZE;
+    audioCount--;
+
+    player.playFolder(cue.folder, cue.file);
+
+    audioPlaying = true;
+    audioStartedAt = millis();
+  }
+}
+
+
+// --- RGB LED --- //
+// Common-cathode RGB LED. PWM brightness is kept simple and active-high.
+void setRGB(uint8_t r, uint8_t g, uint8_t b) {
+  analogWrite(RGB_RED_PIN, r);
+  analogWrite(RGB_GREEN_PIN, g);
+  analogWrite(RGB_BLUE_PIN, b);
+}
+
+void ledBlue()   { setRGB(0, 0, 180); }
+void ledCyan()   { setRGB(0, 180, 180); }
+void ledRed()    { setRGB(200, 0, 0); }
+void ledOrange() { setRGB(220, 70, 0); }
+void ledGreen()  { setRGB(0, 180, 0); }
+void ledPurple() { setRGB(100, 0, 150); }
+
+
+// --- Names and UI --- //
+// The library represents each item using an enum value, such as ItemType::Laptop.
+// The LCD needs a readable string, so this function converts the enum into a name.
+const char* itemName(ItemType type) {
+  switch (type) {
+    case ItemType::Wallet:      return "Wallet";
+    case ItemType::Laptop:      return "Laptop";
+    case ItemType::Phone:       return "Phone";
+    case ItemType::Keys:        return "Keys";
+    case ItemType::Charger:     return "Charger";
+    case ItemType::WaterBottle: return "Water bottle";
+    case ItemType::Medication:  return "Medication";
+    case ItemType::Glasses:     return "Glasses";
+    case ItemType::Umbrella:    return "Umbrella";
+    case ItemType::Book:        return "Book";
+    case ItemType::Headphones:  return "Headphones";
+    case ItemType::Diary:       return "Diary";
+    default:                    return "Unknown item";
+  }
+}
+
+const char* taskName(TaskType type) {
+  switch (type) {
+    case TaskType::University: return "University";
+    case TaskType::Gym:        return "Gym";
+    case TaskType::Work:       return "Work";
+    case TaskType::Doctors:    return "Doctors";
+    case TaskType::Park:       return "Park";
+    default:                   return "No task";
+  }
+}
+
+
+// This order must match ItemType values and the /02 audio filenames (001-012).
+// When the RFID reader encounters an unknown tag, the program can later let
+// the user select what type of item that tag represents.
+const ItemType ITEM_CHOICES[] = {
+  ItemType::Wallet,
+  ItemType::Laptop,
+  ItemType::Phone,
+  ItemType::Keys,
+  ItemType::Charger,
+  ItemType::WaterBottle,
+  ItemType::Medication,
+  ItemType::Glasses,
+  ItemType::Umbrella,
+  ItemType::Book,
+  ItemType::Headphones,
+  ItemType::Diary
+};
+
+const uint8_t ITEM_CHOICE_COUNT =
+    sizeof(ITEM_CHOICES) / sizeof(ITEM_CHOICES[0]);
+
+// Tracks the currently highlighted item in the RFID registration menu.
+uint8_t selectedItemIndex = 0;
+
+void showRegistrationMenu() {
+  lcd.clear();
+
+  // First row: menu title and current position.
+  lcd.setCursor(0, 0);
+  lcd.print("Select item ");
+  lcd.print(selectedItemIndex + 1);
+  lcd.print("/");
+  lcd.print(ITEM_CHOICE_COUNT);
+
+  // Second row: currently highlighted item.
+  lcd.setCursor(0, 1);
+  lcd.print("> ");
+  lcd.print(itemName(ITEM_CHOICES[selectedItemIndex]));
+
+  ledPurple();
+}
+
+
+// --- Reminder Logic --- //
+// Program remembers when last reminder was triggered. Five-minute interval.
+unsigned long lastReminderAt = 0;
+
+const unsigned long REMINDER_INTERVAL_MS = 5UL * 60UL * 1000UL;
+
+// --- Idle Screen --- //
+// Displays the default screen when no task is active, then sets the LED to blue.
+void showIdleScreen() {
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Smart Backpack");
+  lcd.setCursor(0, 1);
+  lcd.print("Select a task");
+  ledBlue();
+}
+
+
+// --- Task Screen --- //
+// Top row displays the selected task.
+// Second row informs required items or if ready.
+void showTaskScreen() {
+  lcd.clear();
+
+  // lcd.setCursor(0, 0); lcd.print(taskName(backpack.getCurrentTask()));
+
+  if (backpack.isTaskComplete()) {
+    lcd.setCursor(0, 1);
+    lcd.print("All items ready!");
+  } else {
+    lcd.setCursor(0, 1);
+    lcd.print("Need: ");
+    lcd.print(itemName(backpack.getNextRequiredItem()));
+  }
+}
+
+
+// --- Register Tasks --- //
+// Keep these Task objects available so the audio announcement uses the
+// exact same requiredItems list that is registered with the library.
+Task shopsTask{};
+Task doctorsTask{};
+Task friendHouseTask{};
+
+// This defines what needs to be packed for each task.
+void registerPresetTasks() {
+  // Button 1: Shops
+  shopsTask.type = TaskType::Shops;
+  shopsTask.requiredItems[0] = ItemType::Laptop;
+  shopsTask.requiredItems[1] = ItemType::Phone;
+  shopsTask.requiredItems[2] = ItemType::Keys;
+  shopsTask.itemCount = 3;
+  shopsTask.reminderAudio = 7;
+  backpack.registerTask(shopsTask);
+
+  // Button 2: Doctors
+  doctorsTask.type = TaskType::Doctors;
+  doctorsTask.requiredItems[0] = ItemType::Wallet;
+  doctorsTask.requiredItems[1] = ItemType::Phone;
+  doctorsTask.requiredItems[2] = ItemType::Medication;
+  doctorsTask.itemCount = 3;
+  doctorsTask.reminderAudio = 4;
+  backpack.registerTask(doctorsTask);
+
+  // Button 3: Friend's house
+  friendHouseTask.type = TaskType::FriendHouse;
+  friendHouseTask.requiredItems[0] = ItemType::Wallet;
+  friendHouseTask.requiredItems[1] = ItemType::Phone;
+  friendHouseTask.requiredItems[2] = ItemType::Keys;
+  friendHouseTask.itemCount = 3;
+  friendHouseTask.reminderAudio = 6;
+  backpack.registerTask(friendHouseTask);
+}
+
+// Announce all items configured for the selected task, then tell the user
+// to pack them. Audio file numbers in folder 02 match ItemType values.
+void announceTaskItems(TaskType taskType) {
+  const Task* selectedTask = nullptr;
+
+  if (taskType == shopsTask.type) {
+    selectedTask = &shopsTask;
+  } else if (taskType == doctorsTask.type) {
+    selectedTask = &doctorsTask;
+  } else if (taskType == friendHouseTask.type) {
+    selectedTask = &friendHouseTask;
+  }
+
+  if (selectedTask == nullptr) {
+    return;
+  }
+
+  for (uint8_t i = 0; i < selectedTask->itemCount; i++) {
+    queueAudio(2, static_cast<uint8_t>(selectedTask->requiredItems[i]));
+  }
+
+  // Play after every item name has been queued.
+  queueAudio(1, 8);
+}
+
+
+// --- Task Control --- //
+// The function implements three possible outcomes:
+//   1. If the requested task is already active, stop it.
+//   2. If another task is active, refuse to switch and display a warning.
+//   3. If no task is active, try to start the requested task.
+void startOrStopTask(TaskType requestedTask) {
+  if (backpack.isTaskActive()) {
+    if (backpack.getCurrentTask() == requestedTask) {
+      backpack.stopTask();
+    } else {
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Task already on");
+      lcd.setCursor(0, 1);
+      lcd.print(taskName(backpack.getCurrentTask()));
+      ledOrange();
+    }
+
+    return;
+  }
+
+  if (!backpack.startTask(requestedTask)) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Could not start");
+    lcd.setCursor(0, 1);
+    lcd.print(taskName(requestedTask));
+    ledRed();
+    return;
+  }
+
+  suppressNextItemRequiredAudio = true;
+  lastReminderAt = millis();
+}
+
+
+// --- RFID Handling --- //
+// Convert the final four UID bytes to the uint32_t tag ID used by Inventory.
+// This matches the tag-ID format used by the backpack library.
+// ------------------------------- RFID ----------------------------------------
+
+bool sameRFIDTag(const RFIDTagID& a, const RFIDTagID& b)
+{
+    if (a.length != b.length)
+    {
+        return false;
+    }
+    for (uint8_t i = 0; i < a.length; i++)
+    {
+        if (a.bytes[i] != b.bytes[i])
+        {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool makeRFIDTagID(MFRC522& reader, RFIDTagID& tagID)
+{
+    uint8_t uidLength = reader.uid.size;
+
+    if (uidLength == 0 || uidLength > MAX_RFID_UID_BYTES)
+    {
+        return false;
+    }
+
+    tagID.length = uidLength;
+
+    for (uint8_t i = 0; i < uidLength; i++)
+    {
+        tagID.bytes[i] = reader.uid.uidByte[i];
+    }
+
+    return true;
+}
+
+// Prevent a tag held against a reader from being processed repeatedly.
+RFIDTagID lastProcessedTag{};
+bool hasLastProcessedTag = false;
+unsigned long lastProcessedAt = 0;
+
+const unsigned long RFID_COOLDOWN_MS = 1500;
+
+// --- Admin registration for new RFID tags --- //
+// A new/unknown tag opens registration automatically. Choose an item type
+// by entering its number in the Serial Monitor (set line ending to Newline).
+bool adminRegistrationActive = false;
+RFIDTagID pendingTagID{};
+
+
+// Keep registered tag-to-item mappings across power cycles.
+// The user guide documents a maximum inventory capacity of 20 items.
+const uint32_t EEPROM_INVENTORY_MAGIC = 0x45534931UL; // "ESI1"
+const uint8_t EEPROM_INVENTORY_VERSION = 1;
+const uint8_t SAVED_ITEM_LIMIT = 20;
+
+struct SavedRFIDItem {
+    uint8_t length;
+    uint8_t bytes[MAX_RFID_UID_BYTES];
+    uint8_t itemType;
+};
+
+struct SavedInventory {
+    uint32_t magic;
+    uint8_t version;
+    uint8_t count;
+    SavedRFIDItem items[SAVED_ITEM_LIMIT];
+};
+
+SavedInventory savedInventoryData{};
+
+void saveRegisteredItems()
+{
+    EEPROM.put(0, savedInventoryData);
+}
+
+void loadRegisteredItems()
+{
+    EEPROM.get(0, savedInventoryData);
+
+    if (savedInventoryData.magic != EEPROM_INVENTORY_MAGIC ||
+        savedInventoryData.version != EEPROM_INVENTORY_VERSION ||
+        savedInventoryData.count > SAVED_ITEM_LIMIT) {
+        memset(&savedInventoryData, 0, sizeof(savedInventoryData));
+        Serial.println(F("No saved RFID assignments found."));
+        return;
+    }
+
+    for (uint8_t i = 0; i < savedInventoryData.count; i++) {
+        SavedRFIDItem& savedItem = savedInventoryData.items[i];
+
+        if (savedItem.length == 0 ||
+            savedItem.length > MAX_RFID_UID_BYTES ||
+            savedItem.itemType == 0 ||
+            savedItem.itemType > ITEM_CHOICE_COUNT) {
+            continue;
+        }
+
+        RFIDTagID tagID{};
+        tagID.length = savedItem.length;
+        for (uint8_t b = 0; b < tagID.length; b++) {
+            tagID.bytes[b] = savedItem.bytes[b];
+        }
+
+        inventory.registerItem(
+            tagID, static_cast<ItemType>(savedItem.itemType));
+    }
+
+    Serial.print(F("Loaded saved RFID assignments: "));
+    Serial.println(inventory.getItemCount());
+}
+
+//FOR TESTING ONLY TO CLEAR VALUES
+void clearSavedRFIDItems()
+{
+    // Clear the saved inventory structure in memory.
+    memset(&savedInventoryData, 0, sizeof(savedInventoryData));
+
+    // Write the cleared structure to EEPROM.
+    EEPROM.put(0, savedInventoryData);
+
+    Serial.println(F("Saved RFID assignments cleared."));
+    Serial.println(F("Restart the Arduino to reload an empty inventory."));
+}
+
+void printTagID(const RFIDTagID& tagID)
+{
+    for (uint8_t i = 0; i < tagID.length; i++) {
+        if (tagID.bytes[i] < 0x10) Serial.print('0');
+        Serial.print(tagID.bytes[i], HEX);
+    }
+}
+
+void beginAdminRegistration(const RFIDTagID& tagID) {
+  pendingTagID = tagID;
+  adminRegistrationActive = true;
+
+  // Start with the first item.
+  selectedItemIndex = 0;
+
+  Serial.println();
+  Serial.println(F("Unknown RFID tag detected."));
+  Serial.print(F("Tag UID: "));
+  printTagID(pendingTagID);
+  Serial.println();
+
+  Serial.println(F("Use B1 = Up, B2 = Down, B3 = Select"));
+
+  showRegistrationMenu();
+}
+
+void finishAdminRegistration() {
+  ItemType selectedType = ITEM_CHOICES[selectedItemIndex];
+
+  // Guard against duplicate registration.
+  if (inventory.findItem(pendingTagID) != nullptr) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Tag registered");
+    adminRegistrationActive = false;
+    return;
+  }
+
+  if (savedInventoryData.count >= SAVED_ITEM_LIMIT) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Storage full");
+
+    adminRegistrationActive = false;
+    return;
+  }
+
+  if (!inventory.registerItem(pendingTagID, selectedType)) {
+    lcd.clear();
+    lcd.setCursor(0, 0);
+    lcd.print("Register failed");
+    lcd.setCursor(0, 1);
+    lcd.print("Try again");
+
+    // Stay in the menu so the user can try selecting again.
+    showRegistrationMenu();
+    return;
+  }
+
+  // Save the RFID tag-to-item mapping.
+  SavedRFIDItem& savedItem =
+      savedInventoryData.items[savedInventoryData.count++];
+
+  memset(&savedItem, 0, sizeof(savedItem));
+
+  savedItem.length = pendingTagID.length;
+
+  for (uint8_t i = 0; i < pendingTagID.length; i++) {
+    savedItem.bytes[i] = pendingTagID.bytes[i];
+  }
+
+  savedItem.itemType = static_cast<uint8_t>(selectedType);
+
+  savedInventoryData.magic = EEPROM_INVENTORY_MAGIC;
+  savedInventoryData.version = EEPROM_INVENTORY_VERSION;
+
+  saveRegisteredItems();
+
+  // The tag was scanned in the backpack, so mark the item as present.
+  backpack.itemAdded(pendingTagID);
+
+  lastProcessedTag = pendingTagID;
+  hasLastProcessedTag = true;
+  lastProcessedAt = millis();
+
+  lcd.clear();
+  lcd.setCursor(0, 0);
+  lcd.print("Saved item:");
+  lcd.setCursor(0, 1);
+  lcd.print(itemName(selectedType));
+
+  Serial.print(F("Registered tag as "));
+  Serial.println(itemName(selectedType));
+
+  adminRegistrationActive = false;
+}
+
+void serviceAdminRegistration() {
+  if (!adminRegistrationActive) {
+    return;
+  }
+
+  // B1: move up through the item list.
+  if (buttonPressed(0)) {
+    if (selectedItemIndex == 0) {
+      selectedItemIndex = ITEM_CHOICE_COUNT - 1;
+    } else {
+      selectedItemIndex--;
+    }
+
+    showRegistrationMenu();
+  }
+
+  // B2: move down through the item list.
+  if (buttonPressed(1)) {
+    selectedItemIndex++;
+
+    if (selectedItemIndex >= ITEM_CHOICE_COUNT) {
+      selectedItemIndex = 0;
+    }
+
+    showRegistrationMenu();
+  }
+
+  // B3: confirm the highlighted item.
+  if (buttonPressed(2)) {
+    finishAdminRegistration();
+  }
+}
+
+void handleRFID()
+{
+    // Pause normal scanning while the user assigns the unknown tag.
+    if (adminRegistrationActive) return;
+    for (uint8_t i = 0; i < 4; i++)
+    {
+        if (!readers[i].PICC_IsNewCardPresent() ||
+            !readers[i].PICC_ReadCardSerial())
+        {
+            continue;
+        }
+
+        RFIDTagID tagID{};
+
+        if (!makeRFIDTagID(readers[i], tagID))
+        {
+            readers[i].PICC_HaltA();
+            readers[i].PCD_StopCrypto1();
+            continue;
+        }
+
+        unsigned long now = millis();
+
+        // Ignore the same tag if it was just processed.
+        bool duplicate =
+            hasLastProcessedTag &&
+            sameRFIDTag(tagID, lastProcessedTag) &&
+            (now - lastProcessedAt < RFID_COOLDOWN_MS);
+
+        if (!duplicate)
+        {
+            lastProcessedTag = tagID;
+            hasLastProcessedTag = true;
+            lastProcessedAt = now;
+
+            Item* item = inventory.findItem(tagID);
+
+            if (item == nullptr)
+            {
+                // Enter admin registration instead of leaving the tag unknown.
+                beginAdminRegistration(tagID);
+            }
+            else if (item->location == Location::Backpack)
+            {
+                // The item is currently recorded as inside.
+                backpack.itemRemoved(tagID);
+            }
+            else
+            {
+                // The item is outside or its location is unknown.
+                backpack.itemAdded(tagID);
+            }
+        }
+
+        readers[i].PICC_HaltA();
+        readers[i].PCD_StopCrypto1();
+
+        // Process at most one reader per loop.
+        return;
+    }
+}
+// --- Event Handling --- //
+// The backpack library generates events when something important happens.
+// The backpack responds to those events with user feedback.
+void handleEvent(const BackpackEvent& event) {
+  switch (event.type) {
+    case EventType::TaskStarted:
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print(taskName(event.task));
+      lcd.setCursor(0, 1);
+      lcd.print("Task selected");
+      queueAudio(3, static_cast<uint8_t>(event.task));
+      announceTaskItems(event.task);
+      ledCyan();
+      break;
+
+    case EventType::TaskStopped:
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Task stopped");
+      queueAudio(1, 6);
+      ledOrange();
+      break;
+
+    case EventType::TaskComplete:
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Task complete!");
+      lcd.setCursor(0, 1);
+      lcd.print("Ready to go");
+      queueAudio(1, 1);
+      queueAudio(1, 7);
+      ledGreen();
+      break;
+
+    case EventType::ItemRequired:
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Still need:");
+      lcd.setCursor(0, 1);
+      lcd.print(itemName(event.item));
+
+      // The initial full list has already been announced when the task starts.
+      // Suppress the library's first ItemRequired audio to avoid repeating it.
+      if (suppressNextItemRequiredAudio) {
+        suppressNextItemRequiredAudio = false;
+      } else {
+        queueAudio(2, static_cast<uint8_t>(event.item));
+      }
+
+      ledRed();
+      break;
+
+    case EventType::ItemAcquired:
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Added:");
+      lcd.setCursor(0, 1);
+      lcd.print(itemName(event.item));
+      queueAudio(1, 2);
+      ledGreen();
+      break;
+
+    case EventType::ItemAdded:
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Item added:");
+      lcd.setCursor(0, 1);
+      lcd.print(itemName(event.item));
+      queueAudio(1, 2);
+      ledGreen();
+      break;
+
+    case EventType::ItemRemoved:
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Item removed:");
+      lcd.setCursor(0, 1);
+      lcd.print(itemName(event.item));
+      queueAudio(1, 5);
+      ledOrange();
+      break;
+
+    case EventType::ItemNotRequired:
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Not needed:");
+      lcd.setCursor(0, 1);
+      lcd.print(itemName(event.item));
+      queueAudio(1, 3);
+      ledPurple();
+      break;
+
+    case EventType::UnknownRFID:
+      lcd.clear();
+      lcd.setCursor(0, 0);
+      lcd.print("Unknown RFID tag");
+      lcd.setCursor(0, 1);
+      lcd.print("Choose item type");
+      ledPurple();
+      break;
+
+    case EventType::TaskReminder:
+      queueAudio(4, static_cast<uint8_t>(event.task));
+      showTaskScreen();
+      break;
+
+    case EventType::ItemAlreadyPresent:
+    case EventType::Unknown:
+    default:
+      break;
+  }
+}
+
+
+// Processing Events
+void serviceEvents() {
+  while (backpack.hasEvent()) {
+    BackpackEvent event = backpack.getEvent();
+    handleEvent(event);
+  }
+}
+
+void handleSerialCommands()
+{
+    if (Serial.available())
+    {
+        String command = Serial.readStringUntil('\n');
+        command.trim();
+
+        if (command.equalsIgnoreCase("RESET"))
+        {
+            clearSavedRFIDItems();
+        }
+    }
+}
+
+//Sends out reminder to user on what task they are doing
+void serviceReminder() {
+  if (!backpack.isTaskActive()) {
+    return;
+  }
+  unsigned long now = millis();
+  if (now - lastReminderAt >= REMINDER_INTERVAL_MS) {
+    lastReminderAt = now;
+    BackpackEvent event{};
+    event.type = EventType::TaskReminder;
+    event.task = backpack.getCurrentTask();
+    handleEvent(event);
+  }
+}
+
+// --- Initialisation --- //
+// Configures the serial monitor, buttons, LED outputs, LCD, RFID readers and
+// DFPlayer. Starts backpack library, registers the three tasks, displays the
+// idle screen and queues the ready-to-go sound.
+void setup() {
+  Serial.begin(9600);
+
+  pinMode(BUTTON_1_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_2_PIN, INPUT_PULLUP);
+  pinMode(BUTTON_3_PIN, INPUT_PULLUP);
+
+  pinMode(RGB_RED_PIN, OUTPUT);
+  pinMode(RGB_GREEN_PIN, OUTPUT);
+  pinMode(RGB_BLUE_PIN, OUTPUT);
+
+  lcd.begin(16, 2);
+  lcd.clear();
+  lcd.print("Smart Backpack");
+
+  // On the Mega, keep hardware SPI master-select pin 53 as an output.
+  pinMode(53, OUTPUT);
+  digitalWrite(53, HIGH);
+
+  // Deselect all four RFID readers before starting SPI.
+  for (uint8_t i = 0; i < 4; i++) {
+    pinMode(RFID_SS_PINS[i], OUTPUT);
+    digitalWrite(RFID_SS_PINS[i], HIGH);
+  }
+
+  SPI.begin();
+
+  // Keep every reader's SS pin inactive before initializing readers.
+  for (uint8_t i = 0; i < 4; i++)
+  {
+    pinMode(RFID_SS_PINS[i], OUTPUT);
+    digitalWrite(RFID_SS_PINS[i], HIGH);
+  }
+
+  for (uint8_t i = 0; i < 4; i++)
+  {
+    readers[i].PCD_Init();
+  }
+
+  dfSerial.begin(9600);
+  delay(1000);
+
+  if (player.begin(dfSerial, true, true)) {
+    dfPlayerReady = true;
+    player.volume(22);
+    delay(200);
+  }
+
+  lastTrackFinishedAt = millis();
+
+  backpack.begin();
+  loadRegisteredItems();  // Restore saved RFID-to-item assignments from EEPROM
+  registerPresetTasks();
+  showIdleScreen();
+
+  queueAudio(1, 7);
+}
+
+
+void loop() {
+  handleSerialCommands();
+  if (adminRegistrationActive) {
+    // During registration, buttons control the item selection menu.
+    // Do not interpret them as task-selection buttons.
+    serviceAdminRegistration();
+  } else {
+    // Normal operation: buttons select or stop tasks.
+    bool b1 = buttonPressed(0);
+    bool b2 = buttonPressed(1);
+    bool b3 = buttonPressed(2);
+
+    if (b1) startOrStopTask(TaskType::Shops);
+    if (b2) startOrStopTask(TaskType::Doctors);
+    if (b3) startOrStopTask(TaskType::FriendHouse);
+
+    // Scan RFID readers only outside registration mode.
+    handleRFID();
+  }
+
+  // Keep servicing events and audio in both modes.
+  serviceEvents();
+  serviceReminder();
+  serviceAudio();
+}
